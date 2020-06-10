@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -377,10 +378,11 @@ var _ socket = &sysSocket{}
 
 // A sysSocket is a socket which uses system calls for socket operations.
 type sysSocket struct {
-	mu     sync.RWMutex
-	fd     *os.File
-	closed bool
-	g      *lockedNetNSGoroutine
+	// Atomics must come first.
+	closed *uint32
+
+	fd *os.File
+	g  *lockedNetNSGoroutine
 }
 
 // newSysSocket creates a sysSocket that optionally locks its internal goroutine
@@ -391,19 +393,19 @@ func newSysSocket(config *Config) (*sysSocket, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &sysSocket{
-		g: g,
+		closed: new(uint32),
+		g:      g,
 	}, nil
 }
 
+// All sysSocket internal methods must check the status of s.closed before
+// executing.
+
 // do runs f in a worker goroutine which can be locked to one thread.
 func (s *sysSocket) do(f func()) error {
-	// All operations handled by this function are assumed to only
-	// read from s.done.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if atomic.LoadUint32(s.closed) != 0 {
 		return syscall.EBADF
 	}
 
@@ -413,10 +415,7 @@ func (s *sysSocket) do(f func()) error {
 
 // read executes f, a read function, against the associated file descriptor.
 func (s *sysSocket) read(f func(fd int) bool) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if atomic.LoadUint32(s.closed) != 0 {
 		return syscall.EBADF
 	}
 
@@ -429,10 +428,7 @@ func (s *sysSocket) read(f func(fd int) bool) error {
 
 // write executes f, a write function, against the associated file descriptor.
 func (s *sysSocket) write(f func(fd int) bool) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if atomic.LoadUint32(s.closed) != 0 {
 		return syscall.EBADF
 	}
 
@@ -445,10 +441,7 @@ func (s *sysSocket) write(f func(fd int) bool) error {
 
 // control executes f, a control function, against the associated file descriptor.
 func (s *sysSocket) control(f func(fd int)) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if atomic.LoadUint32(s.closed) != 0 {
 		return syscall.EBADF
 	}
 
@@ -542,21 +535,20 @@ func (s *sysSocket) Bind(sa unix.Sockaddr) error {
 }
 
 func (s *sysSocket) Close() error {
-	// Be sure to acquire a write lock because we need to stop any other
-	// goroutines from sending system call requests after close.
-	// Any invocation of do() after this write lock unlocks is guaranteed
-	// to find s.done being true.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The caller has expressed an intent to close the socket, so immediately
+	// increment s.closed to force further calls to result in EBADF before also
+	// closing the file descriptor to unblock any outstanding operations.
+	//
+	// Because other operations simply check for s.closed != 0, we will permit
+	// double Close, which would increment s.closed beyond 1.
+	if atomic.AddUint32(s.closed, 1) != 1 {
+		// Multiple Close calls.
+		return nil
+	}
 
-	// Close the socket from the main thread, this operation has no risk
-	// of routing data to the wrong socket.
+	// Close the socket and stop its associated goroutine.
 	err := s.fd.Close()
-	s.closed = true
-
-	// Stop the associated goroutine and wait for it to return.
 	s.g.stop()
-
 	return err
 }
 
