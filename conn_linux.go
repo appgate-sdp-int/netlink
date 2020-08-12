@@ -158,7 +158,10 @@ func (c *conn) Receive() ([]Message, error) {
 		// Double in size if not enough bytes
 		b = make([]byte, len(b)*2)
 	}
+	return c.ReceiveUsing(b)
+}
 
+func (c *conn) ReceiveUsing(b []byte) ([]Message, error) {
 	// Read out all available messages
 	n, _, _, _, err := c.s.Recvmsg(b, nil, 0)
 	if err != nil {

@@ -49,6 +49,7 @@ type Socket interface {
 	Send(m Message) error
 	SendMessages(m []Message) error
 	Receive() ([]Message, error)
+	ReceiveUsing(b []byte) ([]Message, error)
 }
 
 // Dial dials a connection to netlink, using the specified netlink family.
@@ -245,11 +246,49 @@ func (c *Conn) Receive() ([]Message, error) {
 	return c.lockedReceive()
 }
 
+func (c *Conn) ReceiveUsing(b []byte) ([]Message, error) {
+	// Wait for any concurrent calls to Execute to finish before proceeding.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lockedReceiveUsing(b)
+}
+
 // lockedReceive implements Receive, but must be called with c.mu acquired for reading.
 // We rely on the kernel to deal with concurrent reads and writes to the netlink
 // socket itself.
 func (c *Conn) lockedReceive() ([]Message, error) {
 	msgs, err := c.receive()
+	if err != nil {
+		c.debug(func(d *debugger) {
+			d.debugf(1, "recv: err: %v", err)
+		})
+
+		return nil, err
+	}
+
+	c.debug(func(d *debugger) {
+		for _, m := range msgs {
+			d.debugf(1, "recv: %+v", m)
+		}
+	})
+
+	// When using nltest, it's possible for zero messages to be returned by receive.
+	if len(msgs) == 0 {
+		return msgs, nil
+	}
+
+	// Trim the final message with multi-part done indicator if
+	// present.
+	if m := msgs[len(msgs)-1]; m.Header.Flags&Multi != 0 && m.Header.Type == Done {
+		return msgs[:len(msgs)-1], nil
+	}
+
+	return msgs, nil
+}
+
+func (c *Conn) lockedReceiveUsing(b []byte) ([]Message, error) {
+	msgs, err := c.receiveUsing(b)
 	if err != nil {
 		c.debug(func(d *debugger) {
 			d.debugf(1, "recv: err: %v", err)
@@ -291,6 +330,50 @@ func (c *Conn) receive() ([]Message, error) {
 	var res []Message
 	for {
 		msgs, err := c.sock.Receive()
+		if err != nil {
+			return nil, newOpError("receive", err)
+		}
+
+		// If this message is multi-part, we will need to perform an recursive call
+		// to continue draining the socket
+		var multi bool
+
+		for _, m := range msgs {
+			if err := checkMessage(m); err != nil {
+				return nil, err
+			}
+
+			// Does this message indicate a multi-part message?
+			if m.Header.Flags&Multi == 0 {
+				// No, check the next messages.
+				continue
+			}
+
+			// Does this message indicate the last message in a series of
+			// multi-part messages from a single read?
+			multi = m.Header.Type != Done
+		}
+
+		res = append(res, msgs...)
+
+		if !multi {
+			// No more messages coming.
+			return res, nil
+		}
+	}
+}
+
+func (c *Conn) receiveUsing(b[]byte) ([]Message, error) {
+	// NB: All non-nil errors returned from this function *must* be of type
+	// OpError in order to maintain the appropriate contract with callers of
+	// this package.
+	//
+	// This contract also applies to functions called within this function,
+	// such as checkMessage.
+
+	var res []Message
+	for {
+		msgs, err := c.sock.ReceiveUsing(b)
 		if err != nil {
 			return nil, newOpError("receive", err)
 		}
