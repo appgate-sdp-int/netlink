@@ -599,7 +599,7 @@ func (c *Conn) SyscallConn() (syscall.RawConn, error) {
 		return nil, notSupported("syscall-conn")
 	}
 
-	return newRawConn(fc.File())
+	return fc.File().SyscallConn()
 }
 
 // fixMsg updates the fields of m using the logic specified in Send.
@@ -672,21 +672,6 @@ type Config struct {
 	// to 0.
 	NetNS int
 
-	// DisableNSLockThread disables package netlink's default goroutine thread
-	// locking behavior.
-	//
-	// By default, the library will lock the processing goroutine to its
-	// corresponding OS thread in order to enable communication over netlink to
-	// a different network namespace.
-	//
-	// If the caller already knows that the netlink socket is in the same
-	// namespace as the calling thread, this can introduce a performance
-	// impact. This option disables the OS thread locking behavior if
-	// performance considerations are of interest.
-	//
-	// If disabled, it is the responsibility of the caller to make sure that all
-	// threads are running in the correct namespace.
-	//
-	// When DisableNSLockThread is set, the caller cannot set the NetNS value.
+	// DisableNSLockThread is deprecated and has no effect.
 	DisableNSLockThread bool
 }
